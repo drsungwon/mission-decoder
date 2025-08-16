@@ -1,30 +1,17 @@
 # ==============================================================================
-# Encrypted Log Decryption Utility (v2.0)
+# Encrypted Log Decryption Utility (v2.2 - Final)
 # ------------------------------------------------------------------------------
 # [프로그램 설명]
-# 이 스크립트는 'mission-python' 프로젝트의 'utility.py'에 의해 생성된
-# 암호화된 로그 파일(`log.encrypted`, `signature.encrypted` 등)을 복호화하는
-# 교수/관리자용 도구입니다.
-#
-# 파일은 여러 개의 '청크(chunk)'가 연이어 붙어있는 형태로 구성되어 있습니다.
-# 각 청크는 [암호화된 세션키][데이터 길이][암호화된 데이터] 구조를 가집니다.
-# 이 스크립트는 파일을 순차적으로 읽으며 각 청크를 복호화하고, 이를 하나로 합쳐
-# 최종 평문 텍스트 파일을 생성합니다.
-#
-# [사전 준비]
-#   - Python 3.9+
-#   - Poetry (의존성 관리 도구)
-#   - 복호화를 위한 RSA 개인키 파일 (예: 'private_key.pem')
-#
-# [설치]
-#   poetry install
+#   이 스크립트는 'mission-python' 프로젝트의 'utility.py'에 의해 생성된
+#   암호화된 로그 파일(`log.encrypted`, `signature.encrypted` 등)을 복호화하는
+#   교수/관리자용 도구입니다.
 #
 # [사용 방법]
-#   명령줄에서 아래 형식으로 실행합니다.
+#   명령줄에서 아래 형식으로 실행합니다. --help 플래그로 상세한 도움말을 볼 수 있습니다.
 #   poetry run python -m mission_decoder.main [입력 파일] [개인키] [출력 파일]
 #
 # [예시]
-#   poetry run python -m mission_decoder.main ./log.encrypted ./private_key.pem ./log.decrypted.txt
+#   poetry run python -m mission_decoder.main ./log.encrypted ./keys/private_key.pem ./log.decrypted.txt
 #
 # ==============================================================================
 
@@ -32,187 +19,193 @@
 # --- 1. 필수 모듈 임포트 ---
 
 import sys
-import os
-import struct  # 바이너리 데이터를 다루기 위한 모듈 (데이터 길이를 바이트로 변환)
+import struct
+
+# `argparse`: 명령줄 인자를 파싱하고, 도움말 메시지를 자동으로 생성하는 강력한 표준 라이브러리.
+import argparse
+# `pathlib.Path`: 파일 시스템 경로를 문자열이 아닌 객체로 다루어, 더 안전하고 직관적인 코드 작성을 돕는 표준 라이브러리.
+from pathlib import Path
+
+# --- `cryptography` 라이브러리 임포트 ---
 from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
+# `RSAPrivateKey`: `private_key` 객체의 타입을 명확히 지정하기 위한 클래스. 코드의 가독성과 정적 분석에 도움을 줍니다.
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import serialization, hashes, padding as aes_padding
 
 # --- 2. 상수 정의 ---
-# 이 값들은 암호화를 수행한 `crypto.py`의 값과 반드시 일치해야 합니다.
+# 이 값들은 암호화를 수행한 'crypto.py'의 상수 값과 반드시 일치해야 복호화가 가능합니다.
 
 AES_KEY_SIZE = 32           # AES-256 사용 (32 바이트)
-AES_IV_SIZE = 16            # AES 블록 크기와 동일한 16 바이트 IV
-RSA_ENCRYPTED_KEY_SIZE = 256  # 2048비트 RSA 공개키로 암호화된 세션키의 크기 (2048 / 8)
+AES_IV_SIZE = 16            # AES 블록 크기와 동일한 16 바이트 IV(Initialization Vector)
+RSA_ENCRYPTED_KEY_SIZE = 256  # 2048비트 RSA 공개키로 암호화된 세션키의 크기 (2048 bits / 8 = 256 bytes)
 
 
 # --- 3. 핵심 기능 함수 ---
 
-def print_status(tag, message, is_error=False):
-    """Cargo 스타일의 상태 메시지를 출력하는 헬퍼 함수입니다."""
-    # 태그를 항상 9자리로 고정하고 중앙 정렬하여 출력 포맷을 맞춥니다.
-    # 예: [  INFO   ], [  ERROR  ], [ SUCCESS ]
+def print_status(tag: str, message: str, is_error: bool = False):
+    """
+    Cargo 스타일의 상태 메시지를 출력하는 헬퍼 함수입니다.
+    출력 포맷을 일관되게 유지하고, 에러 메시지를 별도로 관리합니다.
+    """
+    # 태그를 항상 9자리 너비로 만들고, 텍스트를 중앙에 정렬하여 시각적 통일성을 줍니다.
+    # 예: '[  INFO   ]', '[  ERROR  ]', '[ SUCCESS ]'
     formatted_tag = f"[{tag.upper():^9}]"
     
-    # 에러 메시지는 표준 에러(stderr)로, 일반 메시지는 표준 출력(stdout)으로 보냅니다.
+    # 에러 메시지는 표준 에러 스트림(sys.stderr)으로, 일반 메시지는 표준 출력 스트림(sys.stdout)으로 보냅니다.
+    # 이는 출력 리디렉션 시 오류와 일반 로그를 분리할 수 있게 해줍니다.
     stream = sys.stderr if is_error else sys.stdout
     print(f"{formatted_tag} {message}", file=stream)
 
 
-def decrypt_chunk(rsa_encrypted_key: bytes, aes_encrypted_data: bytes, private_key) -> bytes | None:
+def decrypt_chunk(rsa_encrypted_key: bytes, aes_encrypted_data: bytes, private_key: RSAPrivateKey) -> bytes | None:
     """
     하나의 암호화된 청크(chunk)를 받아 복호화합니다.
-    이 함수는 하이브리드 암호화의 역순으로 동작합니다.
-
-    Args:
-        rsa_encrypted_key: RSA로 암호화된 세션키 (AES key + IV)
-        aes_encrypted_data: AES로 암호화된 원본 데이터
-        private_key: 복호화에 사용할 RSA 개인키 객체
-
-    Returns:
-        복호화된 원본 데이터(bytes), 실패 시 None
+    이 함수는 하이브리드 암호화 과정의 정확한 역순으로 동작합니다.
     """
     try:
-        # 1단계: RSA 개인키로 암호화된 세션키(AES key + IV)를 복호화합니다.
-        #       암호화 시 사용했던 OAEP 패딩 스킴을 동일하게 지정해야 합니다.
+        # --- 1단계: RSA 개인키로 세션키(AES key + IV) 복호화 ---
+        # 암호화 시 사용했던 `OAEP` 패딩 스킴과 동일한 설정을 사용해야 정확히 복호화됩니다.
         decrypted_session_key = private_key.decrypt(
             rsa_encrypted_key,
-            rsa_padding.OAEP(
-                mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
+            rsa_padding.OAEP( mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None )
         )
-
-        # 안전장치: 복호화된 세션키의 길이가 예상과 다른 경우, 오류 처리
+        
+        # --- 안전장치: 복호화된 세션키 길이 검증 ---
         expected_len = AES_KEY_SIZE + AES_IV_SIZE
         if len(decrypted_session_key) != expected_len:
-             print_status("error", f"복호화된 세션키의 길이가 올바르지 않습니다 (예상: {expected_len}, 실제: {len(decrypted_session_key)})", is_error=True)
+             print_status("error", f"복호화된 세션키 길이가 올바르지 않습니다 (예상: {expected_len}, 실제: {len(decrypted_session_key)})", is_error=True)
              return None
-
-        # 2단계: 복호화된 세션키를 실제 AES 키와 IV(Initialization Vector)로 분리합니다.
-        aes_key = decrypted_session_key[:AES_KEY_SIZE]
-        iv = decrypted_session_key[AES_KEY_SIZE:]
         
-        # 3단계: 추출된 AES 키와 IV를 사용하여 암호화된 데이터를 복호화합니다.
+        # --- 2단계: 복호화된 세션키를 AES 키와 IV로 분리 ---
+        aes_key = decrypted_session_key[:AES_KEY_SIZE]
+        iv = decrypted_session_key[AES_KEY_SIZE:] # AES_KEY_SIZE부터 끝까지
+        
+        # --- 3단계: AES 키와 IV를 사용하여 실제 데이터 복호화 ---
         cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
         decryptor = cipher.decryptor()
         padded_data = decryptor.update(aes_encrypted_data) + decryptor.finalize()
         
-        # 4단계: 복호화된 데이터에서 PKCS7 패딩을 제거하여 원본 데이터를 복원합니다.
-        #        암호화 시 추가했던 패딩을 제거하는 과정입니다.
+        # --- 4단계: 복호화된 데이터에서 PKCS7 패딩 제거 ---
+        # AES는 블록 단위 암호화이므로, 암호화 시 추가했던 패딩을 제거해야 원본 데이터를 얻을 수 있습니다.
         unpadder = aes_padding.PKCS7(algorithms.AES.block_size).unpadder()
         original_data = unpadder.update(padded_data) + unpadder.finalize()
         return original_data
         
     except Exception as e:
+        # 복호화 과정에서 발생하는 모든 예외(패딩 오류, 키 불일치 등)를 처리합니다.
         print_status("crypto", f"데이터 복호화 중 오류 발생: {e}", is_error=True)
         return None
 
-def decrypt_and_save_log_or_signature(encrypted_log_path: str, private_key_path: str, output_path: str):
+def decrypt_and_save_log(encrypted_file: Path, private_key_file: Path, output_file: Path):
     """
-    메인 실행 함수: 암호화된 로그 파일을 청크 단위로 읽고 복호화하여 결과 파일에 저장합니다.
+    전체 복호화 프로세스를 총괄하는 메인 실행 함수입니다.
+    암호화된 파일을 청크 단위로 읽고 복호화하여 최종 결과 파일에 저장합니다.
     """
     print_status("info", "암호화된 로그 복호화 프로세스를 시작합니다...")
-    print(f"{'':11}  - 입력 파일: {os.path.abspath(encrypted_log_path)}")
-    print(f"{'':11}  - 개인키:    {os.path.abspath(private_key_path)}")
-    print(f"{'':11}  - 출력 파일: {os.path.abspath(output_path)}\n")
+    # `.resolve()`: 심볼릭 링크 등을 모두 해석한 '정규화된 절대 경로'를 반환하여, 경로를 명확하게 보여줍니다.
+    print(f"{'':11}  - 입력 파일: {encrypted_file.resolve()}")
+    print(f"{'':11}  - 개인키:    {private_key_file.resolve()}")
+    print(f"{'':11}  - 출력 파일: {output_file.resolve()}\n")
 
-    # --- 개인키 로딩 ---
-    print_status("step 1", "개인키 파일을 로딩합니다...")
-    try:
-        # 개인키 파일을 바이너리 읽기('rb') 모드로 엽니다.
-        with open(private_key_path, "rb") as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=None  # 개인키가 암호로 보호되지 않았으므로 None
-            )
-        print_status("ok", "개인키 로딩 성공.")
-    except FileNotFoundError:
-        print_status("error", f"개인키 파일 '{private_key_path}'을(를) 찾을 수 없습니다.", is_error=True)
+    # --- 개인키 파일 로딩 ---
+    print_status("step 1", f"개인키 파일 '{private_key_file.name}'을(를) 로딩합니다...")
+    # `.exists()`: Path 객체를 사용하여 파일의 존재 여부를 간결하게 확인합니다.
+    if not private_key_file.exists():
+        print_status("error", f"개인키 파일을 찾을 수 없습니다: {private_key_file}", is_error=True)
         return
+
+    try:
+        # `.read_bytes()`: pathlib의 메서드로, 파일을 열고 바이너리 내용을 읽는 과정을 한 줄로 처리합니다.
+        private_key = serialization.load_pem_private_key(private_key_file.read_bytes(), password=None)
+        print_status("ok", "개인키 로딩 성공.")
     except Exception as e:
         print_status("error", f"개인키 파일을 읽는 중 문제가 발생했습니다: {e}", is_error=True)
         return
 
-    # --- 로그 파일 처리 ---
-    full_decrypted_log_bytes = b''  # 복호화된 모든 청크를 담을 바이트 버퍼
+    # --- 로그 파일 처리 (읽기 -> 복호화 -> 병합) ---
+    full_decrypted_log_bytes = b''  # 복호화된 모든 청크를 메모리에 순서대로 담을 바이트 버퍼
     chunk_count = 0
     
-    print_status("step 2", f"'{encrypted_log_path}' 파일 처리를 시작합니다...")
+    print_status("step 2", f"'{encrypted_file.name}' 파일 처리를 시작합니다...")
+    if not encrypted_file.exists():
+        print_status("error", f"암호화된 로그 파일을 찾을 수 없습니다: {encrypted_file}", is_error=True)
+        return
+
     try:
-        # 암호화된 로그 파일을 바이너리 읽기('rb') 모드로 엽니다.
-        with open(encrypted_log_path, 'rb') as f:
+        # 암호화된 파일을 바이너리 읽기('rb') 모드로 엽니다.
+        with open(encrypted_file, 'rb') as f:
             while True:
-                # 1. 암호화된 세션키 (RSA 블록) 읽기
+                # 1. RSA 블록(암호화된 세션키) 읽기
                 rsa_block = f.read(RSA_ENCRYPTED_KEY_SIZE)
-                if not rsa_block: # 파일의 끝에 도달하면 루프를 종료합니다.
+                if not rsa_block:  # `f.read()`는 파일의 끝에 도달하면 빈 바이트(b'')를 반환합니다.
                     break
 
-                # 2. 데이터 길이 정보 (4바이트) 읽기
+                # 2. 데이터 길이 정보 읽기
                 len_block = f.read(4)
                 if len(len_block) < 4:
-                    print_status("error", f"청크 #{chunk_count + 1}의 데이터 길이 정보를 읽을 수 없습니다. 파일 손상 가능성이 있습니다.", is_error=True)
+                    print_status("error", f"청크 #{chunk_count + 1}의 데이터 길이 정보가 손상되었습니다.", is_error=True)
                     return
                 
-                # struct.unpack: 4바이트의 바이너리 데이터를 파이썬 정수형으로 변환합니다.
-                # '>I'는 '빅엔디안, 부호 없는 4바이트 정수'를 의미합니다.
+                # `struct.unpack`: 4바이트의 바이너리 데이터를 파이썬 정수형으로 변환. '>I'는 '빅엔디안 부호 없는 4바이트 정수' 포맷.
                 aes_data_len = struct.unpack('>I', len_block)[0]
                 
-                # 3. 실제 암호화된 데이터 (AES 블록) 읽기
+                # 3. AES 블록(실제 암호화된 데이터) 읽기
                 aes_block = f.read(aes_data_len)
-                if len(aes_block) != aes_data_len:
-                    print_status("error", f"청크 #{chunk_count + 1}의 데이터가 불완전합니다. (예상 길이: {aes_data_len}, 실제 길이: {len(aes_block)})", is_error=True)
+                if len(aes_block) != aes_data_len: # 읽어온 데이터가 예상 길이보다 짧으면 파일이 손상된 것.
+                    print_status("error", f"청크 #{chunk_count + 1}의 데이터가 불완전합니다. (예상: {aes_data_len}, 실제: {len(aes_block)})", is_error=True)
                     return
                 
                 chunk_count += 1
                 print_status("...", f"청크 #{chunk_count} 복호화 중...")
-                
-                # 4. 읽어온 청크를 복호화합니다.
                 decrypted_chunk = decrypt_chunk(rsa_block, aes_block, private_key)
-                if decrypted_chunk is None:
+                
+                if decrypted_chunk is None: # 청크 복호화에 실패하면 전체 프로세스를 중단.
                     print_status("error", f"로그 청크 #{chunk_count} 복호화에 실패했습니다. 프로세스를 중단합니다.", is_error=True)
                     return
                 
-                # 5. 복호화된 결과를 버퍼에 추가합니다.
                 full_decrypted_log_bytes += decrypted_chunk
         
         # --- 결과 저장 ---
         if chunk_count > 0:
-            print_status("step 3", f"'{output_path}' 파일에 결과를 저장합니다...")
-            # 출력 경로의 디렉토리가 존재하지 않으면 생성합니다.
-            output_dir = os.path.dirname(output_path)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir)
+            print_status("step 3", f"'{output_file.name}' 파일에 결과를 저장합니다...")
+            # `output_file.parent`: 파일 경로에서 디렉토리 부분만 나타내는 Path 객체 (e.g., /path/to/dir/)
+            # `.mkdir(parents=True, exist_ok=True)`: 중간 경로의 모든 부모 디렉토리를 생성하며, 이미 존재해도 오류를 발생시키지 않음.
+            output_file.parent.mkdir(parents=True, exist_ok=True)
             
-            # 복호화된 전체 바이트 데이터를 바이너리 쓰기('wb') 모드로 저장합니다.
-            with open(output_path, "wb") as f_out:
-                f_out.write(full_decrypted_log_bytes)
+            # `.write_bytes()`: pathlib의 메서드로, 바이너리 데이터를 파일에 쓰는 과정을 한 줄로 안전하게 처리합니다.
+            output_file.write_bytes(full_decrypted_log_bytes)
             
             print_status("success", f"총 {chunk_count}개의 청크를 성공적으로 복호화했습니다.")
         else:
             print_status("info", "암호화된 데이터가 없어 복호화를 진행하지 않았습니다.")
 
-    except FileNotFoundError:
-        print_status("error", f"암호화된 로그 파일 '{encrypted_log_path}'을(를) 찾을 수 없습니다.", is_error=True)
     except Exception as e:
         print_status("error", f"로그 파일 처리 중 예상치 못한 오류가 발생했습니다: {e}", is_error=True)
 
 
-# --- 4. 프로그램 진입점 ---
-
-# 이 스크립트가 'python main.py'처럼 직접 실행될 때만 아래 코드가 동작합니다.
+# --- 4. 프로그램 진입점 및 CLI 구성 ---
 if __name__ == "__main__":
-    # 명령줄 인자의 개수를 확인합니다. (스크립트 이름 + 3개 인자 = 총 4개)
-    if len(sys.argv) != 4:
-        print("\n[ 사용법 오류 ]")
-        print("  명령줄 인자가 올바르지 않습니다.")
-        print("  올바른 형식: poetry run python -m mission_decoder.main [입력 파일] [개인키] [출력 파일]")
-        print("\n[ 사용법 예시 ]")
-        print("  poetry run python -m mission_decoder.main ./log.encrypted ./private_key.pem ./log.decrypted.txt")
-        sys.exit(1) # 오류 코드(1)와 함께 프로그램을 종료합니다.
+    # `ArgumentParser` 객체 생성. CLI 프로그램의 기본 정보를 설정합니다.
+    parser = argparse.ArgumentParser(
+        prog="mission-decoder",
+        description="`mission-python` 프로젝트의 암호화된 로그 파일을 복호화합니다.",
+        # `epilog`: 도움말 메시지의 맨 마지막에 표시될 텍스트. 주로 사용 예시를 보여주는 데 사용됩니다.
+        epilog="사용 예시: poetry run python -m mission_decoder.main log.encrypted keys/private_key.pem log.decrypted.txt",
+        formatter_class=argparse.RawTextHelpFormatter # 도움말 포맷을 좀 더 깔끔하게 유지합니다.
+    )
+    
+    # 3개의 '위치 기반(positional)' 인자를 정의합니다. 사용자는 이 인자들을 순서대로 반드시 제공해야 합니다.
+    # `type=Path`: argparse가 입력받은 문자열 경로를 자동으로 `pathlib.Path` 객체로 변환해줍니다.
+    # `help`: `--help` 옵션을 사용했을 때 각 인자에 대해 보여줄 설명.
+    parser.add_argument("input_file", type=Path, help="복호화할 암호화된 파일 경로")
+    parser.add_argument("key_file", type=Path, help="복호화에 사용할 개인키 파일 경로")
+    parser.add_argument("output_file", type=Path, help="복호화된 내용이 저장될 파일 경로")
 
-    # 명령줄 인자를 각각 변수에 할당합니다.
-    encrypted_path, key_path, decrypted_path = sys.argv[1], sys.argv[2], sys.argv[3]
-    # 메인 함수를 호출하여 실제 작업을 시작합니다.
-    decrypt_and_save_log_or_signature(encrypted_path, key_path, decrypted_path)
+    # `parser.parse_args()`: `sys.argv`를 분석하여 정의된 규칙에 맞게 인자를 파싱합니다.
+    # 인자가 규칙에 맞지 않으면, argparse는 자동으로 오류 메시지와 함께 사용법을 출력하고 프로그램을 종료합니다.
+    args = parser.parse_args()
+
+    # 파싱이 성공적으로 완료되면, `args` 객체에 `input_file`, `key_file` 등의 속성으로 인자가 저장됩니다.
+    # 이 인자들을 사용하여 메인 함수를 호출하고 복호화 프로세스를 시작합니다.
+    decrypt_and_save_log(args.input_file, args.key_file, args.output_file)
