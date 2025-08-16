@@ -109,7 +109,7 @@ def decrypt_chunk(rsa_encrypted_key: bytes, aes_encrypted_data: bytes, private_k
         print_status("crypto", f"데이터 복호화 중 오류 발생: {e}", is_error=True)
         return None
 
-def main(encrypted_log_path: str, private_key_path: str, output_path: str):
+def decrypt_and_save_log_or_signature(encrypted_log_path: str, private_key_path: str, output_path: str):
     """
     메인 실행 함수: 암호화된 로그 파일을 청크 단위로 읽고 복호화하여 결과 파일에 저장합니다.
     """
@@ -215,4 +215,4 @@ if __name__ == "__main__":
     # 명령줄 인자를 각각 변수에 할당합니다.
     encrypted_path, key_path, decrypted_path = sys.argv[1], sys.argv[2], sys.argv[3]
     # 메인 함수를 호출하여 실제 작업을 시작합니다.
-    main(encrypted_path, key_path, decrypted_path)
+    decrypt_and_save_log_or_signature(encrypted_path, key_path, decrypted_path)
