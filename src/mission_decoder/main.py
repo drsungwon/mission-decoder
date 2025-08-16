@@ -209,7 +209,7 @@ if __name__ == "__main__":
         print("  명령줄 인자가 올바르지 않습니다.")
         print("  올바른 형식: poetry run python -m mission_decoder.main [입력 파일] [개인키] [출력 파일]")
         print("\n[ 사용법 예시 ]")
-        print("  poetry run python -m mission_decoder.main log.encrypted private_key.pem log.decrypted.txt")
+        print("  poetry run python -m mission_decoder.main ./log.encrypted ./private_key.pem ./log.decrypted.txt")
         sys.exit(1) # 오류 코드(1)와 함께 프로그램을 종료합니다.
 
     # 명령줄 인자를 각각 변수에 할당합니다.
